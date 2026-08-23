@@ -322,6 +322,75 @@ func TestProduce_MessagesVLLMHTTPFullAgenticTurn(t *testing.T) {
 	assert.Equal(t, "Sunny, 22C", toolResult["content"])
 }
 
+// TestProduce_ResponsesVLLMHTTPFullAgenticTurn covers the production path
+// from a parsed OpenAI Responses request through the translated chat-shaped
+// payload sent to vLLM's chat render endpoint.
+func TestProduce_ResponsesVLLMHTTPFullAgenticTurn(t *testing.T) {
+	srv, captured := httpFixture(t, nil, renderResponse{TokenIDs: []uint32{14, 15}})
+	defer srv.Close()
+
+	req := &scheduling.InferenceRequest{
+		Body: &fwkrh.InferenceRequestBody{
+			Responses: &fwkrh.ResponsesRequest{
+				Instructions: "You can use tools.",
+				Input: []any{
+					map[string]any{"role": "user", "content": "Weather in Zurich?"},
+					map[string]any{
+						"type":      "function_call",
+						"call_id":   "call_01",
+						"name":      "get_weather",
+						"arguments": `{"city":"Zurich"}`,
+					},
+					map[string]any{
+						"type":    "function_call_output",
+						"call_id": "call_01",
+						"output":  "Sunny, 22C",
+					},
+				},
+				Tools: []any{
+					map[string]any{"type": "function", "name": "get_weather", "description": "Get the weather"},
+				},
+			},
+		},
+	}
+
+	p := newTestPlugin(newHTTPRenderer(t, srv))
+	require.NoError(t, p.Produce(context.Background(), req, nil))
+	require.NotNil(t, req.Body.TokenizedRequest)
+	assert.Equal(t, []uint32{14, 15}, req.Body.TokenizedRequest.Prompts[0].TokenIDs)
+
+	var sent struct {
+		Model    string           `json:"model"`
+		Messages []map[string]any `json:"messages"`
+		Tools    []map[string]any `json:"tools"`
+	}
+	require.NoError(t, json.Unmarshal(captured.chat, &sent))
+	assert.Equal(t, testHTTPModel, sent.Model)
+	require.Len(t, sent.Tools, 1)
+	function, ok := sent.Tools[0]["function"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "get_weather", function["name"])
+
+	require.Len(t, sent.Messages, 4)
+	assert.Equal(t, "system", sent.Messages[0]["role"])
+	user := sent.Messages[1]
+	assert.Equal(t, "user", user["role"])
+	assert.Equal(t, "Weather in Zurich?", user["content"])
+	assistant := sent.Messages[2]
+	assert.Equal(t, "assistant", assistant["role"])
+	toolCalls, ok := assistant["tool_calls"].([]any)
+	require.True(t, ok)
+	require.Len(t, toolCalls, 1)
+	toolCall, ok := toolCalls[0].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "call_01", toolCall["id"])
+
+	toolResult := sent.Messages[3]
+	assert.Equal(t, "tool", toolResult["role"])
+	assert.Equal(t, "call_01", toolResult["tool_call_id"])
+	assert.Equal(t, "Sunny, 22C", toolResult["content"])
+}
+
 func TestVLLMHTTPRenderer_RenderMultiPrompt(t *testing.T) {
 	srv, _ := httpFixture(t,
 		[]renderResponse{

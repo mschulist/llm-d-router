@@ -1146,3 +1146,168 @@ func TestProduce_MessagesRequestToolSchemaOrder(t *testing.T) {
 		`"parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}`,
 		"input_schema key order must be preserved verbatim")
 }
+
+func TestResponsesToRenderChatRequest_StringInput(t *testing.T) {
+	resp := &fwkrh.ResponsesRequest{
+		Instructions: "You are helpful.",
+		Input:        "Hello",
+	}
+
+	result := ResponsesToRenderChatRequest(resp)
+
+	require.Len(t, result.Conversation, 2)
+	assert.Equal(t, "system", result.Conversation[0].Role)
+	assert.Equal(t, &tokenizerTypes.Content{Raw: "You are helpful."}, result.Conversation[0].Content)
+	assert.Equal(t, "user", result.Conversation[1].Role)
+	assert.Equal(t, &tokenizerTypes.Content{Raw: "Hello"}, result.Conversation[1].Content)
+	assert.True(t, result.AddGenerationPrompt)
+	assert.False(t, result.ContinueFinalMessage)
+}
+
+// TestResponsesToRenderChatRequest_AgenticTurn covers a tool-use round trip:
+// role-dict items pass through, and consecutive reasoning plus function_call
+// output items merge into the single assistant message vLLM renders.
+func TestResponsesToRenderChatRequest_AgenticTurn(t *testing.T) {
+	resp := &fwkrh.ResponsesRequest{
+		Instructions: "You can use tools.",
+		Input: []any{
+			map[string]any{
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Weather in Zurich?"},
+				},
+			},
+			map[string]any{
+				"type":    "reasoning",
+				"content": []any{map[string]any{"type": "reasoning_text", "text": "I should check."}},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"call_id":   "call_01",
+				"name":      "get_weather",
+				"arguments": `{"city":"Zurich"}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_01",
+				"output":  "Sunny, 22C",
+			},
+		},
+	}
+
+	result := ResponsesToRenderChatRequest(resp)
+
+	require.Len(t, result.Conversation, 4)
+
+	system := result.Conversation[0]
+	assert.Equal(t, "system", system.Role)
+	assert.Equal(t, &tokenizerTypes.Content{Raw: "You can use tools."}, system.Content)
+
+	user := result.Conversation[1]
+	assert.Equal(t, "user", user.Role)
+	assert.Equal(t, &tokenizerTypes.Content{
+		Structured: []tokenizerTypes.ContentBlock{{Type: "text", Text: "Weather in Zurich?"}},
+	}, user.Content)
+
+	assistant := result.Conversation[2]
+	assert.Equal(t, "assistant", assistant.Role)
+	assert.Nil(t, assistant.Content)
+	assert.Equal(t, "I should check.", assistant.Reasoning)
+	require.Len(t, assistant.ToolCalls, 1)
+	assert.Equal(t, map[string]any{
+		"id":   "call_01",
+		"type": "function",
+		"function": map[string]any{
+			"name":      "get_weather",
+			"arguments": `{"city":"Zurich"}`,
+		},
+	}, assistant.ToolCalls[0])
+
+	toolResult := result.Conversation[3]
+	assert.Equal(t, "tool", toolResult.Role)
+	assert.Equal(t, "call_01", toolResult.ToolCallID)
+	assert.Equal(t, &tokenizerTypes.Content{Raw: "Sunny, 22C"}, toolResult.Content)
+}
+
+// TestResponsesToRenderChatRequest_ContinueFinalMessage covers the partial
+// assistant continuation: the trailing incomplete item merges into the prior
+// assistant message and suppresses add_generation_prompt.
+func TestResponsesToRenderChatRequest_ContinueFinalMessage(t *testing.T) {
+	partial := func(status string) *fwkrh.ResponsesRequest {
+		return &fwkrh.ResponsesRequest{
+			Input: []any{
+				map[string]any{"role": "user", "content": "Say hi"},
+				map[string]any{"role": "assistant", "content": "Hi", "status": status},
+			},
+		}
+	}
+	completed := func(status string) *fwkrh.ResponsesRequest {
+		r := partial(status)
+		r.Input = []any{
+			r.Input.([]any)[0],
+			map[string]any{"role": "assistant", "content": "Hi", "status": status},
+			map[string]any{"role": "user", "content": "Again"},
+		}
+		return r
+	}
+
+	for _, tc := range []struct {
+		name     string
+		request  *fwkrh.ResponsesRequest
+		messages int
+		content  string
+	}{
+		// A partial assistant item following a non-assistant message still
+		// opens its own assistant entry; continuation is signaled by the flags.
+		{name: "in_progress continues", request: partial("in_progress"), messages: 2, content: "Hi"},
+		{name: "incomplete continues", request: partial("incomplete"), messages: 2, content: "Hi"},
+		{name: "completed opens new turn", request: completed("completed"), messages: 3, content: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result := ResponsesToRenderChatRequest(tc.request)
+			assert.Len(t, result.Conversation, tc.messages)
+			assert.Equal(t, tc.content != "", result.ContinueFinalMessage)
+			assert.Equal(t, tc.content == "", result.AddGenerationPrompt)
+			if tc.content != "" {
+				assert.Equal(t, &tokenizerTypes.Content{Raw: tc.content}, result.Conversation[1].Content)
+			}
+		})
+	}
+}
+
+// TestResponsesToRenderChatRequest_Tools covers flat-to-nested tool
+// conversion: plain functions nest under type/function, namespace tools
+// flatten their inner functions under a "__"-joined name, and non-function
+// tools are dropped since they never reach the prompt.
+func TestResponsesToRenderChatRequest_Tools(t *testing.T) {
+	parameters := map[string]any{"type": "object"}
+	resp := &fwkrh.ResponsesRequest{
+		Input: "Hi",
+		Tools: []any{
+			map[string]any{"type": "web_search"},
+			map[string]any{"type": "function", "name": "get_weather", "description": "Get it", "parameters": parameters},
+			map[string]any{"type": "namespace", "name": "browser", "tools": []any{
+				map[string]any{"type": "function", "name": "click", "parameters": parameters},
+			}},
+		},
+	}
+
+	result := ResponsesToRenderChatRequest(resp)
+
+	require.Len(t, result.Tools, 2)
+	assert.Equal(t, map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":        "get_weather",
+			"description": "Get it",
+			"parameters":  parameters,
+		},
+	}, result.Tools[0])
+	assert.Equal(t, map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":       "browser__click",
+			"parameters": parameters,
+		},
+	}, result.Tools[1])
+}

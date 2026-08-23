@@ -661,6 +661,288 @@ func anthropicImageToURL(src *fwkrh.AnthropicImageSource) string {
 	return "data:" + mediaType + ";base64," + src.Data
 }
 
+// Item types and statuses of the OpenAI Responses API input array.
+const (
+	responsesTypeMessage         = "message"
+	responsesTypeFunctionCall    = "function_call"
+	responsesTypeFunctionCallOut = "function_call_output"
+	responsesTypeReasoning       = "reasoning"
+	responsesStatusInProgress    = "in_progress"
+	responsesStatusIncomplete    = "incomplete"
+	responsesNamespaceSeparator  = "__"
+	responsesToolTypeFunction    = "function"
+	responsesToolTypeNamespace   = "namespace"
+	responsesPartInputText       = "input_text"
+	responsesPartOutputText      = "output_text"
+	responsesPartInputImage      = "input_image"
+)
+
+// ResponsesToRenderChatRequest converts an OpenAI ResponsesRequest into the
+// OpenAI chat shape vLLM builds when serving /v1/responses, so the render
+// backend and the server apply the identical chat-template pipeline to the
+// same request and prefix-cache blocks line up. Mirrors vLLM's
+// construct_input_messages: instructions become a leading system message,
+// string input a user message, and consecutive assistant output items merge
+// into one assistant message. Store-backed item references are not supported.
+func ResponsesToRenderChatRequest(resp *fwkrh.ResponsesRequest) *tokenizerTypes.RenderChatRequest {
+	conversation := make([]tokenizerTypes.Conversation, 0)
+	if instructions, ok := resp.Instructions.(string); ok && instructions != "" {
+		conversation = append(conversation, tokenizerTypes.Conversation{
+			Role:    "system",
+			Content: &tokenizerTypes.Content{Raw: instructions},
+		})
+	}
+
+	switch input := resp.Input.(type) {
+	case string:
+		conversation = append(conversation, tokenizerTypes.Conversation{
+			Role:    "user",
+			Content: &tokenizerTypes.Content{Raw: input},
+		})
+	case []any:
+		for _, item := range input {
+			conversation = appendResponsesItem(conversation, item)
+		}
+	}
+
+	rr := &tokenizerTypes.RenderChatRequest{
+		Conversation: conversation,
+		Tools:        convertResponsesTools(resp.Tools),
+	}
+	rr.ContinueFinalMessage = responsesContinuesFinalMessage(resp.Input)
+	rr.AddGenerationPrompt = !rr.ContinueFinalMessage
+	return rr
+}
+
+// appendResponsesItem appends the chat messages for one Responses input item.
+// A function_call, reasoning, or message item that immediately follows an
+// assistant message merges into it when the receiving field is still unset;
+// otherwise it opens a new assistant message.
+func appendResponsesItem(conversation []tokenizerTypes.Conversation, item any) []tokenizerTypes.Conversation {
+	m, ok := item.(map[string]any)
+	if !ok {
+		return conversation
+	}
+
+	prev := prevResponsesAssistant(conversation)
+	switch m["type"] {
+	case responsesTypeFunctionCall:
+		call := map[string]any{
+			"id":   m["call_id"],
+			"type": responsesToolTypeFunction,
+			"function": map[string]any{
+				"name":      responsesFlatToolName(m),
+				"arguments": m["arguments"],
+			},
+		}
+		if prev != nil {
+			prev.ToolCalls = append(prev.ToolCalls, call)
+			return conversation
+		}
+		return append(conversation, tokenizerTypes.Conversation{Role: "assistant", ToolCalls: []any{call}})
+	case responsesTypeReasoning:
+		reasoning := responsesReasoningText(m)
+		if prev != nil && prev.Reasoning == "" {
+			prev.Reasoning = reasoning
+			return conversation
+		}
+		return append(conversation, tokenizerTypes.Conversation{Role: "assistant", Reasoning: reasoning})
+	case responsesTypeFunctionCallOut:
+		output, _ := m["output"].(string)
+		callID, _ := m["call_id"].(string)
+		return append(conversation, tokenizerTypes.Conversation{
+			Role:       "tool",
+			ToolCallID: callID,
+			Content:    &tokenizerTypes.Content{Raw: output},
+		})
+	case responsesTypeMessage:
+		return appendAssistantText(conversation, prev, responsesFirstPartText(m["content"]))
+	default:
+		role, ok := m["role"].(string)
+		if !ok {
+			// Item types the router cannot resolve without the store
+			// (item_reference) and unknown types contribute no tokens.
+			return conversation
+		}
+		if role == "assistant" {
+			return appendAssistantText(conversation, prev, responsesTextOf(m["content"]))
+		}
+		return append(conversation, tokenizerTypes.Conversation{
+			Role:    role,
+			Content: responsesContent(m["content"]),
+		})
+	}
+}
+
+// prevResponsesAssistant returns the trailing conversation entry when it is an
+// assistant message, for the output-item merge rules.
+func prevResponsesAssistant(conversation []tokenizerTypes.Conversation) *tokenizerTypes.Conversation {
+	if len(conversation) == 0 || conversation[len(conversation)-1].Role != "assistant" {
+		return nil
+	}
+	return &conversation[len(conversation)-1]
+}
+
+// appendAssistantText merges text into the previous assistant message when it
+// carries no content yet; otherwise it appends a new assistant message.
+func appendAssistantText(conversation []tokenizerTypes.Conversation, prev *tokenizerTypes.Conversation, text string) []tokenizerTypes.Conversation {
+	if prev != nil && prev.Content == nil {
+		prev.Content = &tokenizerTypes.Content{Raw: text}
+		return conversation
+	}
+	return append(conversation, tokenizerTypes.Conversation{
+		Role:    "assistant",
+		Content: &tokenizerTypes.Content{Raw: text},
+	})
+}
+
+// responsesReasoningText reads a reasoning item's text from content first,
+// then summary, mirroring vLLM.
+func responsesReasoningText(item map[string]any) string {
+	if text := responsesFirstPartText(item["content"]); text != "" {
+		return text
+	}
+	return responsesFirstPartText(item["summary"])
+}
+
+// responsesFirstPartText returns the text of a content part list's first part.
+func responsesFirstPartText(content any) string {
+	parts, ok := content.([]any)
+	if !ok || len(parts) == 0 {
+		return ""
+	}
+	first, ok := parts[0].(map[string]any)
+	if !ok {
+		return ""
+	}
+	text, _ := first["text"].(string)
+	return text
+}
+
+// responsesTextOf passes plain strings through and otherwise reads the first
+// content part's text, matching how vLLM reads assistant dict items.
+func responsesTextOf(content any) string {
+	if s, ok := content.(string); ok {
+		return s
+	}
+	return responsesFirstPartText(content)
+}
+
+// responsesContent converts a role-dict item's content into chat message
+// content. vLLM's chat renderer accepts Responses-style part types
+// (input_text, output_text, input_image) directly, so they are normalized to
+// their chat-completions equivalents here.
+func responsesContent(content any) *tokenizerTypes.Content {
+	switch c := content.(type) {
+	case string:
+		return &tokenizerTypes.Content{Raw: c}
+	case []any:
+		var blocks []tokenizerTypes.ContentBlock
+		for _, p := range c {
+			part, ok := p.(map[string]any)
+			if !ok {
+				continue
+			}
+			partType, _ := part["type"].(string)
+			switch partType {
+			case blockTypeText, responsesPartInputText, responsesPartOutputText:
+				text, _ := part["text"].(string)
+				blocks = append(blocks, tokenizerTypes.ContentBlock{Type: blockTypeText, Text: text})
+			case responsesPartInputImage:
+				url, _ := part["image_url"].(string)
+				blocks = append(blocks, tokenizerTypes.ContentBlock{Type: blockTypeImageURL, ImageURL: tokenizerTypes.ImageBlock{URL: url}})
+			}
+		}
+		if len(blocks) == 0 {
+			return nil
+		}
+		return &tokenizerTypes.Content{Structured: blocks}
+	default:
+		return nil
+	}
+}
+
+// responsesContinuesFinalMessage reports whether the final input item is a
+// partial assistant message (status in_progress or incomplete), which
+// continues generation instead of opening a new turn.
+func responsesContinuesFinalMessage(input any) bool {
+	items, ok := input.([]any)
+	if !ok || len(items) == 0 {
+		return false
+	}
+	last, ok := items[len(items)-1].(map[string]any)
+	if !ok {
+		return false
+	}
+	itemType, _ := last["type"].(string)
+	switch itemType {
+	case "", responsesTypeMessage, responsesTypeReasoning:
+		status, _ := last["status"].(string)
+		return status == responsesStatusInProgress || status == responsesStatusIncomplete
+	default:
+		return false
+	}
+}
+
+// convertResponsesTools rewrites Responses tool definitions into OpenAI
+// chat-completions tools. Only function tools reach the prompt: namespace
+// tools flatten their inner functions under a "__"-joined name, and other
+// tool types are dropped, mirroring vLLM's construct_tool_dicts.
+func convertResponsesTools(tools any) []any {
+	list, ok := tools.([]any)
+	if !ok || len(list) == 0 {
+		return nil
+	}
+	var out []any
+	for _, t := range list {
+		tool, ok := t.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch tool["type"] {
+		case responsesToolTypeFunction:
+			name, _ := tool["name"].(string)
+			out = append(out, responsesChatTool(tool, name))
+		case responsesToolTypeNamespace:
+			namespace, _ := tool["name"].(string)
+			nested, _ := tool["tools"].([]any)
+			for _, nt := range nested {
+				namespaced, ok := nt.(map[string]any)
+				if !ok || namespaced["type"] != responsesToolTypeFunction {
+					continue
+				}
+				name, _ := namespaced["name"].(string)
+				out = append(out, responsesChatTool(namespaced, namespace+responsesNamespaceSeparator+name))
+			}
+		}
+	}
+	return out
+}
+
+// responsesChatTool nests one flat Responses tool definition as a
+// chat-completions function tool with the given name. The definition is copied
+// rather than mutated so the parsed body stays usable by other plugins.
+func responsesChatTool(flat map[string]any, name string) map[string]any {
+	fn := make(map[string]any, len(flat))
+	for k, v := range flat {
+		if k != "type" && k != "name" {
+			fn[k] = v
+		}
+	}
+	fn["name"] = name
+	return map[string]any{"type": responsesToolTypeFunction, "function": fn}
+}
+
+// responsesFlatToolName joins an optional namespace onto a function_call item's
+// name the way vLLM flattens namespaced calls.
+func responsesFlatToolName(item map[string]any) string {
+	name, _ := item["name"].(string)
+	if namespace, ok := item["namespace"].(string); ok && namespace != "" {
+		return namespace + responsesNamespaceSeparator + name
+	}
+	return name
+}
+
 // convertMMFeaturesToUpstream flattens the kv-cache map-shaped multimodal
 // metadata into a flat list sorted by placeholder offset so consumers see
 // items in prompt order. Returns nil when no content is present.

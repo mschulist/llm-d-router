@@ -129,6 +129,15 @@ func (b renderBackend) produce(ctx context.Context, body *fwkrh.InferenceRequest
 			TokenIDs:           tokenIDs,
 			MultiModalFeatures: convertMMFeaturesToUpstream(mmFeatures),
 		}}}, nil
+	case body.Responses != nil:
+		tokenIDs, mmFeatures, err := b.tk.RenderChat(ctx, responsesPayload(body))
+		if err != nil {
+			return nil, fmt.Errorf("tokenization failed: %w", err)
+		}
+		return &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{
+			TokenIDs:           tokenIDs,
+			MultiModalFeatures: convertMMFeaturesToUpstream(mmFeatures),
+		}}}, nil
 	case body.Generate != nil:
 		return &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{
 			TokenIDs:           body.Generate.TokenIDs,
@@ -190,6 +199,17 @@ func messagesPayload(body *fwkrh.InferenceRequestBody) fwkrh.RequestPayload {
 		data, _ := json.Marshal(rr.Tools)
 		pm["tools"] = json.RawMessage(data)
 	}
+	return pm
+}
+
+// responsesPayload returns the payload for an OpenAI Responses request. The raw
+// body uses the /v1/responses schema (input, instructions), which the /render
+// chat endpoint does not accept, so the payload is always rebuilt from the
+// typed struct into the chat render shape regardless of body.Payload.
+func responsesPayload(body *fwkrh.InferenceRequestBody) fwkrh.RequestPayload {
+	data, _ := json.Marshal(buildChatRenderRequest(ResponsesToRenderChatRequest(body.Responses)))
+	var pm fwkrh.PayloadMap
+	_ = json.Unmarshal(data, &pm)
 	return pm
 }
 
